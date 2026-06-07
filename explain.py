@@ -138,17 +138,19 @@ def compute_gradcam(model, img_tensor) -> np.ndarray | None:
 
     _inp = [None]
 
-    def fwd_hook(module, inp, out):
-        # inp[0]: [seq=257, batch=1, dim=1024] LND, fp16
-        _inp[0] = inp[0]
-        inp[0].retain_grad()   # keep grad on this non-leaf tensor
+    def pre_hook(module, inp):
+        # Detach so this becomes a leaf tensor with requires_grad=True.
+        # Leaf tensors always retain their gradient — no retain_grad() needed.
+        # Detaching here also means the graph below block-23 is cut, which is
+        # fine: GradCAM only needs grad w.r.t. the last block's input activations.
+        x = inp[0].detach().requires_grad_(True)
+        _inp[0] = x
+        return (x,) + inp[1:]
 
-    fh = last_block.register_forward_hook(fwd_hook)
+    fh = last_block.register_forward_pre_hook(pre_hook)
     try:
         model.zero_grad()
         with torch.enable_grad():
-            # Require grad on the input so PyTorch builds the graph through
-            # frozen CLIP parameters all the way to _inp[0]
             img_g = img_tensor.float().detach().requires_grad_(True)
             score = _forward_grad(model, img_g).sigmoid()
             score.backward()
