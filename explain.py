@@ -120,34 +120,52 @@ def _forward_grad(model, img_tensor):
 
 # ── GradCAM ──────────────────────────────────────────────────────
 
-def compute_gradcam(model, img_tensor) -> np.ndarray | None:
+def compute_gradcam(model, img_tensor, block_idx: int = -8) -> np.ndarray | None:
     """
-    GradCAM on the INPUT activations of the last ViT-L/14 ResidualAttentionBlock.
+    GradCAM on the output of an intermediate ViT-L/14 ResidualAttentionBlock.
 
-    Why the input, not the output?
-      ln_post only reads x[:,0,:] (the CLS token), so the patch-position outputs
-      of the last block have ∂score/∂output = 0 and GradCAM would be all zeros.
-      The block's INPUT is the output of layer 22.  There, every patch position
-      has a nonzero gradient because the CLS token's output in layer 23 is
-      computed via self-attention over all 257 input tokens.
+    The key trick: inject a leaf tensor at ln_pre (just before the transformer)
+    so that every subsequent intermediate tensor — including the target block's
+    output — has requires_grad=True and can call retain_grad().  This means the
+    gradient flows naturally through ALL self-attention layers (including the
+    target block's own attention), with no graph-cutting at the target layer.
+
+    Gradient at the target block output = ∂score/∂act, computed by backprop
+    through the full transformer stack (blocks target → 23 → ln_post → head).
+
+    Why intermediate block (default -8 = layer 16/24)?
+      ln_post reads only x[:,0,:] (CLS token). By layer 23 the CLS is a
+      fully-global summary; attention to individual patches is near-uniform and
+      the gradient is diffuse. Layer 16 still has local-spatial selectivity
+      while carrying enough semantics for the deepfake cues.
 
     Returns a [224,224] float32 heatmap in [0,1], or None on failure.
     """
     vit = model.model.visual
-    last_block = list(vit.transformer.resblocks.children())[-1]
+    blocks = list(vit.transformer.resblocks.children())
+    target_block = blocks[block_idx]
 
-    _inp = [None]
+    _act = [None]
+    _leaf = [None]
 
-    def pre_hook(module, inp):
-        # Detach so this becomes a leaf tensor with requires_grad=True.
-        # Leaf tensors always retain their gradient — no retain_grad() needed.
-        # Detaching here also means the graph below block-23 is cut, which is
-        # fine: GradCAM only needs grad w.r.t. the last block's input activations.
-        x = inp[0].detach().requires_grad_(True)
-        _inp[0] = x
-        return (x,) + inp[1:]
+    def ln_pre_hook(module, inp, out):
+        # Replace ln_pre output with a leaf tensor so that every downstream
+        # intermediate tensor inherits requires_grad=True.  The permute+transformer
+        # after this point are all differentiable, so retain_grad() will work
+        # anywhere inside the transformer.
+        leaf = out.detach().requires_grad_(True)
+        _leaf[0] = leaf
+        return leaf
 
-    fh = last_block.register_forward_pre_hook(pre_hook)
+    def target_hook(module, inp, out):
+        # out has requires_grad=True (inherits from ln_pre leaf).
+        # retain_grad() keeps .grad populated after backward() on non-leaf tensors.
+        out.retain_grad()
+        _act[0] = out
+
+    h_pre    = vit.ln_pre.register_forward_hook(ln_pre_hook)
+    h_target = target_block.register_forward_hook(target_hook)
+
     try:
         model.zero_grad()
         with torch.enable_grad():
@@ -155,23 +173,24 @@ def compute_gradcam(model, img_tensor) -> np.ndarray | None:
             score = _forward_grad(model, img_g).sigmoid()
             score.backward()
 
-        if _inp[0] is None or _inp[0].grad is None:
+        if _act[0] is None or _act[0].grad is None:
             print("GradCAM: gradient did not reach the target layer.")
             return None
 
-        # Patch tokens: indices 1:257 (index 0 = CLS), squeeze batch dim
-        act  = _inp[0][1:, 0, :].float().detach()   # [256, 1024]
-        grad = _inp[0].grad[1:, 0, :].float()        # [256, 1024]
+        # Patch tokens: indices 1:257  (index 0 = CLS),  squeeze batch dim
+        act  = _act[0][1:, 0, :].float().detach()   # [256, 1024]
+        grad = _act[0].grad[1:, 0, :].float()        # [256, 1024]
 
-        # Pool gradients over patch positions → per-channel importance weight
-        weights = grad.mean(dim=0)                   # [1024]
-        cam = F.relu((act * weights).sum(dim=-1))    # [256]
+        # Per-channel importance weights (global-average-pooled over patch positions)
+        weights = grad.mean(dim=0)                    # [1024]
+        cam = F.relu((act * weights).sum(dim=-1))     # [256]
 
         heatmap = _normalise(cam.reshape(GRID, GRID).cpu().numpy())
         return _upsample_map(heatmap)
 
     finally:
-        fh.remove()
+        h_pre.remove()
+        h_target.remove()
 
 
 # ── Occlusion ────────────────────────────────────────────────────
@@ -392,6 +411,9 @@ def main():
                         help="Number of interpolation steps for IG")
     parser.add_argument("--occlusion_patch", type=int, default=14,
                         help="Occlusion tile size in pixels (14 = ViT patch grid)")
+    parser.add_argument("--gradcam_layer", type=int, default=-8,
+                        help="ViT block index for GradCAM (negative = from end; "
+                             "default -8 = layer 16/24, good spatial selectivity)")
     opt = parser.parse_args()
 
     methods = set(opt.method)
@@ -400,7 +422,7 @@ def main():
 
     out_path = opt.output or (os.path.splitext(opt.image)[0] + "_explain.png")
 
-    print(f"Loading model …")
+    print("Loading model …")
     model = load_model(opt.checkpoint)
 
     print(f"Image: {opt.image}")
@@ -414,9 +436,12 @@ def main():
     results = []
 
     if "gradcam" in methods:
-        print("GradCAM …")
-        h = compute_gradcam(model, img_tensor)
-        results.append(("GradCAM\n(last ViT block input)", h))
+        layer = opt.gradcam_layer
+        n_blocks = len(list(model.model.visual.transformer.resblocks.children()))
+        abs_idx = layer if layer >= 0 else n_blocks + layer
+        print(f"GradCAM (block {abs_idx}/{n_blocks-1}) …")
+        h = compute_gradcam(model, img_tensor, block_idx=layer)
+        results.append((f"GradCAM\n(ViT block {abs_idx}/{n_blocks-1} output)", h))
 
     if "occlusion" in methods:
         p = opt.occlusion_patch
