@@ -15,6 +15,7 @@ Scores near 1.0 = fake, near 0.0 = real.
 
 import os
 import csv
+import json
 import argparse
 import torch
 import numpy as np
@@ -183,6 +184,7 @@ def main():
                         help="Full model checkpoint (backbone was not frozen)")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Decision threshold: score > threshold => fake")
+    parser.add_argument("--output_json", default="predictions.json", help="Output JSON path")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker processes for parallel image loading")
@@ -225,9 +227,16 @@ def main():
             writer.writerow(["path", "score", "prediction"])
             writer.writerows(results)
 
+    json_list = [
+        {"id": os.path.basename(path), "pred_label": 1 if pred == "fake" else 0}
+        for path, score, pred in results
+    ]
+    with open(opt.output_json, "w") as f:
+        json.dump(json_list, f, indent=2)
+
     scores = np.array([r[1] for r in results])
     n_fake = sum(1 for r in results if r[2] == "fake")
-    print(f"\nDone. Results saved to {opt.output}")
+    print(f"\nDone. Results saved to {opt.output} and {opt.output_json}")
     print(f"  Total: {len(results)}  |  Fake: {n_fake}  |  Real: {len(results) - n_fake}")
     print(f"  Score mean: {scores.mean():.3f}  |  std: {scores.std():.3f}")
 
