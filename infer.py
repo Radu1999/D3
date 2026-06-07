@@ -25,6 +25,7 @@ from sklearn.metrics import (
     f1_score, accuracy_score, roc_auc_score,
     precision_score, recall_score, classification_report,
 )
+from torch.utils.data import Dataset, DataLoader
 from models.clip_models import CLIPModelShuffleAttentionPenultimateLayer
 from models import get_model
 
@@ -93,38 +94,45 @@ def collect_labeled_images(image_dir):
     return paths, labels
 
 
-def run_inference(model, paths, batch_size, threshold, transform, labels=None):
-    """Run inference. If labels provided, also return them aligned to valid paths."""
+class ImageDataset(Dataset):
+    def __init__(self, paths, labels, transform):
+        self.paths = paths
+        self.labels = labels  # None for unlabeled
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        img = Image.open(path).convert("RGB")
+        img = self.transform(img)
+        label = self.labels[idx] if self.labels is not None else -1
+        return img, label, path
+
+
+def run_inference(model, paths, batch_size, threshold, transform, labels=None, num_workers=4):
+    """Run inference using a DataLoader for parallel image loading."""
+    dataset = ImageDataset(paths, labels, transform)
+    loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+
     results = []
     valid_labels = [] if labels is not None else None
-    n_batches = (len(paths) + batch_size - 1) // batch_size
     model.eval()
     with torch.no_grad():
-        for i in tqdm(range(0, len(paths), batch_size), total=n_batches, unit="batch"):
-            batch_paths = paths[i : i + batch_size]
-            batch_labels = labels[i : i + batch_size] if labels is not None else None
-            imgs = []
-            valid_paths = []
-            kept_labels = []
-            for j, p in enumerate(batch_paths):
-                try:
-                    imgs.append(transform(Image.open(p).convert("RGB")))
-                    valid_paths.append(p)
-                    if batch_labels is not None:
-                        kept_labels.append(batch_labels[j])
-                except Exception as e:
-                    tqdm.write(f"Warning: skipping {p} ({e})")
-            if not imgs:
-                continue
-            tensor = torch.stack(imgs).cuda()
-            out = model(tensor)
+        for imgs, batch_labels, batch_paths in tqdm(loader, unit="batch"):
+            imgs = imgs.cuda(non_blocking=True)
+            out = model(imgs)
             if out.shape[-1] == 2:
                 out = out[:, 0]
             scores = out.sigmoid().flatten().cpu().numpy()
-            for k, (path, score) in enumerate(zip(valid_paths, scores)):
+            for path, score, lbl in zip(batch_paths, scores, batch_labels.tolist()):
                 results.append((path, float(score), "fake" if score > threshold else "real"))
                 if valid_labels is not None:
-                    valid_labels.append(kept_labels[k])
+                    valid_labels.append(lbl)
     return results, valid_labels
 
 
@@ -176,6 +184,8 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Decision threshold: score > threshold => fake")
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes for parallel image loading")
     opt = parser.parse_args()
 
     transform = transforms.Compose([
@@ -201,7 +211,8 @@ def main():
     print(f"Found {len(paths)} images. Running inference...")
 
     results, valid_labels = run_inference(
-        model, paths, opt.batch_size, opt.threshold, transform, labels=labels
+        model, paths, opt.batch_size, opt.threshold, transform,
+        labels=labels, num_workers=opt.num_workers,
     )
 
     with open(opt.output, "w", newline="") as f:
