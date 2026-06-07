@@ -283,17 +283,14 @@ def compute_sam_occlusion(
 
 
 def _save_sam_segments(img_np, masks, drops, baseline, top_k, out_prefix):
-    """Save a figure showing the top_k segments ranked by |score drop per pixel|."""
+    """Save a figure showing the top_k segments ranked by |score drop|."""
     from scipy.ndimage import binary_dilation
 
-    def _per_pixel(drop, m):
-        return abs(drop) / max(m["segmentation"].sum(), 1)
-
-    ranked = sorted(zip(drops, masks), key=lambda x: _per_pixel(*x), reverse=True)
+    ranked = sorted(zip(drops, masks), key=lambda x: abs(x[0]), reverse=True)
     ranked = ranked[:top_k]
 
-    # Normalise per-pixel drops across all shown segments for consistent colour intensity
-    pp_vals = [abs(d) / max(m["segmentation"].sum(), 1) for d, m in ranked]
+    # Normalise raw drops for consistent colour intensity across shown segments
+    pp_vals = [abs(d) for d, m in ranked]
     pp_max  = max(pp_vals) + 1e-8
 
     cols = min(3, top_k)
@@ -314,7 +311,7 @@ def _save_sam_segments(img_np, masks, drops, baseline, top_k, out_prefix):
         bg   = img_f * 0.15 + grey * 0.15   # very dark, slightly grey
 
         # ── segment: full colour + semi-transparent fill ──────────
-        intensity = pp / pp_max             # 0→1 relative to strongest segment
+        intensity = abs(drop) / pp_max       # 0→1 relative to strongest segment
         if drop > 0:                        # supports fake → warm red/orange
             fill_color = np.array([1.0, 0.25 * (1 - intensity), 0.0])
         else:                               # suppresses fake → cool blue
@@ -336,7 +333,7 @@ def _save_sam_segments(img_np, masks, drops, baseline, top_k, out_prefix):
         sign      = "▼ fake" if drop > 0 else "▲ fake"
         txt_color = "#ff9955" if drop > 0 else "#55bbff"
         ax.set_title(
-            f"#{rank+1}  {sign}\nΔ/px = {pp:+.5f}   |   Δ = {drop:+.3f}   |   {n_px} px",
+            f"#{rank+1}  {sign}\nΔ = {drop:+.3f}   |   {n_px} px",
             fontsize=11, color=txt_color, pad=6,
         )
         ax.axis("off")
@@ -348,7 +345,7 @@ def _save_sam_segments(img_np, masks, drops, baseline, top_k, out_prefix):
         ax.axis("off")
 
     plt.suptitle(
-        f"Top-{top_k} SAM segments  ·  ranked by |Δ score / pixel|  ·  base score {baseline:.3f}",
+        f"Top-{top_k} SAM segments  ·  ranked by |Δ score|  ·  base score {baseline:.3f}",
         fontsize=14, color="white", y=1.01,
     )
     plt.tight_layout(pad=2.0)
