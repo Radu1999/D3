@@ -1,8 +1,14 @@
 """
-Unlabeled inference script for D³.
+Inference script for D³.
 
-Usage:
+Unlabeled mode (default):
     python infer.py --checkpoint ckpt/classifier.pth --image_dir /path/to/images
+
+Eval mode (labeled real/fake directory):
+    python infer.py --checkpoint ckpt/classifier.pth --image_dir /path/to/dataset --eval
+
+In eval mode, image_dir must contain real/ and fake/ subdirectories.
+Outputs F1, accuracy, ROC-AUC, precision, and recall.
 
 Scores near 1.0 = fake, near 0.0 = real.
 """
@@ -14,6 +20,11 @@ import torch
 import numpy as np
 from PIL import Image
 from torchvision import transforms
+from tqdm import tqdm
+from sklearn.metrics import (
+    f1_score, accuracy_score, roc_auc_score,
+    precision_score, recall_score, classification_report,
+)
 from models.clip_models import CLIPModelShuffleAttentionPenultimateLayer
 from models import get_model
 
@@ -64,20 +75,45 @@ def collect_images(image_dir):
     return sorted(paths)
 
 
-def run_inference(model, paths, batch_size, threshold, transform):
+def collect_labeled_images(image_dir):
+    """Collect images from real/ and fake/ subdirs, return (paths, labels)."""
+    real_dir = os.path.join(image_dir, "real")
+    fake_dir = os.path.join(image_dir, "fake")
+    if not os.path.isdir(real_dir) or not os.path.isdir(fake_dir):
+        raise ValueError(
+            f"--eval mode requires {image_dir} to contain real/ and fake/ subdirectories"
+        )
+    paths, labels = [], []
+    for p in sorted(collect_images(real_dir)):
+        paths.append(p)
+        labels.append(0)
+    for p in sorted(collect_images(fake_dir)):
+        paths.append(p)
+        labels.append(1)
+    return paths, labels
+
+
+def run_inference(model, paths, batch_size, threshold, transform, labels=None):
+    """Run inference. If labels provided, also return them aligned to valid paths."""
     results = []
+    valid_labels = [] if labels is not None else None
+    n_batches = (len(paths) + batch_size - 1) // batch_size
     model.eval()
     with torch.no_grad():
-        for i in range(0, len(paths), batch_size):
+        for i in tqdm(range(0, len(paths), batch_size), total=n_batches, unit="batch"):
             batch_paths = paths[i : i + batch_size]
+            batch_labels = labels[i : i + batch_size] if labels is not None else None
             imgs = []
             valid_paths = []
-            for p in batch_paths:
+            kept_labels = []
+            for j, p in enumerate(batch_paths):
                 try:
                     imgs.append(transform(Image.open(p).convert("RGB")))
                     valid_paths.append(p)
+                    if batch_labels is not None:
+                        kept_labels.append(batch_labels[j])
                 except Exception as e:
-                    print(f"Warning: skipping {p} ({e})")
+                    tqdm.write(f"Warning: skipping {p} ({e})")
             if not imgs:
                 continue
             tensor = torch.stack(imgs).cuda()
@@ -85,17 +121,49 @@ def run_inference(model, paths, batch_size, threshold, transform):
             if out.shape[-1] == 2:
                 out = out[:, 0]
             scores = out.sigmoid().flatten().cpu().numpy()
-            for path, score in zip(valid_paths, scores):
+            for k, (path, score) in enumerate(zip(valid_paths, scores)):
                 results.append((path, float(score), "fake" if score > threshold else "real"))
-            if (i // batch_size) % 10 == 0:
-                print(f"  processed {min(i + batch_size, len(paths))}/{len(paths)}")
-    return results
+                if valid_labels is not None:
+                    valid_labels.append(kept_labels[k])
+    return results, valid_labels
+
+
+def print_eval_metrics(results, labels, threshold):
+    scores = np.array([r[1] for r in results])
+    y_true = np.array(labels)
+    y_pred = (scores > threshold).astype(int)
+
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    roc_auc = roc_auc_score(y_true, scores)
+
+    n_real = int((y_true == 0).sum())
+    n_fake = int((y_true == 1).sum())
+    n_correct = int((y_pred == y_true).sum())
+
+    print(f"\n{'='*50}")
+    print(f"  Eval results  (threshold={threshold})")
+    print(f"{'='*50}")
+    print(f"  Total:     {len(results)}  (real={n_real}, fake={n_fake})")
+    print(f"  Correct:   {n_correct}")
+    print(f"  Accuracy:  {acc*100:.2f}%")
+    print(f"  Precision: {prec*100:.2f}%")
+    print(f"  Recall:    {rec*100:.2f}%")
+    print(f"  F1:        {f1*100:.2f}%")
+    print(f"  ROC-AUC:   {roc_auc:.4f}")
+    print(f"{'='*50}")
+    print(classification_report(y_true, y_pred, target_names=["real", "fake"]))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="D³ unlabeled inference")
+    parser = argparse.ArgumentParser(description="D³ inference / eval")
     parser.add_argument("--checkpoint", required=True, help="Path to .pth checkpoint")
-    parser.add_argument("--image_dir", required=True, help="Directory of images to classify")
+    parser.add_argument("--image_dir", required=True,
+                        help="Image directory. In --eval mode must contain real/ and fake/ subdirs.")
+    parser.add_argument("--eval", action="store_true",
+                        help="Eval mode: image_dir has real/ and fake/ subdirs; compute metrics.")
     parser.add_argument("--output", default="predictions.csv", help="Output CSV path")
     parser.add_argument("--arch", default="CLIP:ViT-L/14", help="Backbone (e.g. CLIP:ViT-L/14, res50)")
     parser.add_argument("--head_type", default="attention",
@@ -121,24 +189,39 @@ def main():
     model.cuda()
     print("Model loaded.")
 
-    paths = collect_images(opt.image_dir)
+    if opt.eval:
+        paths, labels = collect_labeled_images(opt.image_dir)
+    else:
+        paths = collect_images(opt.image_dir)
+        labels = None
+
     if not paths:
         print(f"No images found in {opt.image_dir}")
         return
     print(f"Found {len(paths)} images. Running inference...")
 
-    results = run_inference(model, paths, opt.batch_size, opt.threshold, transform)
+    results, valid_labels = run_inference(
+        model, paths, opt.batch_size, opt.threshold, transform, labels=labels
+    )
 
     with open(opt.output, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["path", "score", "prediction"])
-        writer.writerows(results)
+        if opt.eval:
+            writer.writerow(["path", "score", "prediction", "ground_truth"])
+            for (path, score, pred), gt in zip(results, valid_labels):
+                writer.writerow([path, score, pred, "fake" if gt == 1 else "real"])
+        else:
+            writer.writerow(["path", "score", "prediction"])
+            writer.writerows(results)
 
     scores = np.array([r[1] for r in results])
     n_fake = sum(1 for r in results if r[2] == "fake")
     print(f"\nDone. Results saved to {opt.output}")
     print(f"  Total: {len(results)}  |  Fake: {n_fake}  |  Real: {len(results) - n_fake}")
     print(f"  Score mean: {scores.mean():.3f}  |  std: {scores.std():.3f}")
+
+    if opt.eval:
+        print_eval_metrics(results, valid_labels, opt.threshold)
 
 
 if __name__ == "__main__":
