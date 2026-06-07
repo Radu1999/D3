@@ -283,37 +283,75 @@ def compute_sam_occlusion(
 
 
 def _save_sam_segments(img_np, masks, drops, baseline, top_k, out_prefix):
-    """Save a figure showing the top_k segments ranked by |score drop|."""
-    ranked = sorted(zip(drops, masks), key=lambda x: abs(x[0]), reverse=True)
+    """Save a figure showing the top_k segments ranked by |score drop per pixel|."""
+    from scipy.ndimage import binary_dilation
+
+    def _per_pixel(drop, m):
+        return abs(drop) / max(m["segmentation"].sum(), 1)
+
+    ranked = sorted(zip(drops, masks), key=lambda x: _per_pixel(*x), reverse=True)
     ranked = ranked[:top_k]
 
-    cols  = min(5, top_k)
-    rows  = (top_k + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows + 0.6))
+    # Normalise per-pixel drops across all shown segments for consistent colour intensity
+    pp_vals = [abs(d) / max(m["segmentation"].sum(), 1) for d, m in ranked]
+    pp_max  = max(pp_vals) + 1e-8
+
+    cols = min(3, top_k)
+    rows = (top_k + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 6.5 * rows + 1.0),
+                             facecolor="#111")
     axes = np.array(axes).reshape(-1)
 
-    cmap_pos = plt.get_cmap("Reds")
-    cmap_neg = plt.get_cmap("Blues")
+    img_f = img_np.astype(np.float32) / 255.0
 
-    for ax, (drop, m) in zip(axes, ranked):
-        seg   = m["segmentation"]
-        vis   = img_np.copy().astype(np.float32) / 255.0
-        # Dim non-segment pixels
-        vis[~seg] *= 0.25
-        # Tint segment by drop direction
-        color = cmap_pos(min(abs(drop) * 4, 1.0))[:3] if drop > 0 else cmap_neg(min(abs(drop) * 4, 1.0))[:3]
-        overlay = np.zeros_like(vis)
-        overlay[seg] = color
-        vis = np.clip(vis * 0.6 + overlay * 0.4, 0, 1)
-        ax.imshow(vis)
-        sign  = "▼ fake" if drop > 0 else "▲ fake"
-        ax.set_title(f"{sign}  Δ={drop:+.3f}\n(base {baseline:.3f})", fontsize=8)
+    for rank, (ax, (drop, m)) in enumerate(zip(axes, ranked)):
+        seg  = m["segmentation"]          # [H, W] bool
+        n_px = max(seg.sum(), 1)
+        pp   = abs(drop) / n_px
+
+        # ── background: desaturate + dim ──────────────────────────
+        grey = img_f.mean(axis=2, keepdims=True)
+        bg   = img_f * 0.15 + grey * 0.15   # very dark, slightly grey
+
+        # ── segment: full colour + semi-transparent fill ──────────
+        intensity = pp / pp_max             # 0→1 relative to strongest segment
+        if drop > 0:                        # supports fake → warm red/orange
+            fill_color = np.array([1.0, 0.25 * (1 - intensity), 0.0])
+        else:                               # suppresses fake → cool blue
+            fill_color = np.array([0.0, 0.45, 1.0])
+
+        fill = np.zeros_like(img_f)
+        fill[seg] = fill_color
+
+        vis = bg.copy()
+        vis[seg] = img_f[seg] * 0.55 + fill[seg] * 0.45   # segment: image + tint
+
+        # ── border: dilated mask outline ──────────────────────────
+        border = binary_dilation(seg, iterations=2) & ~seg
+        border_color = np.array([1.0, 0.9, 0.0]) if drop > 0 else np.array([0.4, 0.9, 1.0])
+        vis[border] = border_color
+
+        ax.imshow(np.clip(vis, 0, 1), interpolation="lanczos")
+
+        sign      = "▼ fake" if drop > 0 else "▲ fake"
+        txt_color = "#ff9955" if drop > 0 else "#55bbff"
+        ax.set_title(
+            f"#{rank+1}  {sign}\nΔ/px = {pp:+.5f}   |   Δ = {drop:+.3f}   |   {n_px} px",
+            fontsize=11, color=txt_color, pad=6,
+        )
         ax.axis("off")
+        for spine in ax.spines.values():
+            spine.set_visible(False)
 
     for ax in axes[len(ranked):]:
+        ax.set_facecolor("#111")
         ax.axis("off")
 
-    plt.suptitle(f"Top-{top_k} SAM segments by |score drop|", fontsize=11)
+    plt.suptitle(
+        f"Top-{top_k} SAM segments  ·  ranked by |Δ score / pixel|  ·  base score {baseline:.3f}",
+        fontsize=14, color="white", y=1.01,
+    )
+    plt.tight_layout(pad=2.0)
     plt.tight_layout()
     seg_path = out_prefix + "_sam_segments.png"
     plt.savefig(seg_path, dpi=150, bbox_inches="tight")
