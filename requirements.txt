@@ -1,65 +1,47 @@
-# PyTorch — CUDA 11.8 wheels (matches environment.yml)
-# For CPU-only / macOS: remove the --extra-index-url line and use plain torch==2.1.0
---extra-index-url https://download.pytorch.org/whl/cu118
-torch==2.1.0+cu118
-torchvision==0.16.0+cu118
-torchaudio==2.1.0+cu118
+# Core deep learning
+torch
+torchvision
+torchaudio
 
 # Core scientific stack
-numpy==1.24.3
-scipy==1.10.1
-scikit-learn==1.3.1
-scikit-image==0.21.0
-pandas==2.0.3
-openpyxl==3.0.10
-sympy==1.11.1
-networkx==3.1
+numpy>=1.26
+scipy>=1.11
+scikit-learn>=1.4
+scikit-image>=0.22
+pandas>=2.1
+openpyxl
+sympy
+networkx
 
 # Image / vision
-Pillow==10.0.1
-opencv-python==4.8.1.78
-imageio==2.31.5
-tifffile==2023.7.10
-pywavelets==1.4.1
-lazy-loader==0.3
+Pillow
+opencv-python
+imageio
+tifffile
+pywavelets
 
-# CLIP tokenizer
-ftfy==6.1.1
-regex==2023.10.3
+# CLIP tokenizer utilities
+ftfy
+regex
 
 # Model utilities
-timm==0.4.9
-captum==0.7.0
+timm>=0.9
+captum
 
 # Training / logging
-tensorboardx==2.6.2.2
-tqdm==4.66.1
-gpustat==1.1.1
-nvidia-ml-py==12.535.108
-psutil==5.9.5
+tensorboardx
+tqdm
+gpustat
+nvidia-ml-py
+psutil
 
-# Visualisation
-matplotlib==3.7.3
-contourpy==1.1.1
-cycler==0.12.1
-fonttools==4.43.1
-kiwisolver==1.4.5
-pyparsing==3.1.1
+# Visualization
+matplotlib
 
-# General
-requests==2.31.0
-PyYAML==6.0
-six==1.16.0
-typing_extensions==4.7.1
-python-dateutil==2.8.2
-pytz==2023.3.post1
-packaging==23.2
-protobuf==4.24.4
-importlib-resources==6.1.0
-zipp==3.17.0
-wcwidth==0.2.8
-blessed==1.20.0
-pytorchtools==0.0.2
-utils==1.0.1
-joblib==1.3.2
-threadpoolctl==3.2.0
+# General utilities
+requests
+PyYAML
+typing_extensions
+protobuf
+joblib
+threadpoolctl
