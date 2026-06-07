@@ -158,10 +158,12 @@ def compute_gradcam(model, img_tensor, block_idx: int = -8) -> np.ndarray | None
         return leaf
 
     def target_hook(module, inp, out):
-        # out has requires_grad=True (inherits from ln_pre leaf).
-        # retain_grad() keeps .grad populated after backward() on non-leaf tensors.
-        out.retain_grad()
-        _act[0] = out
+        # This hook fires for both the shuffled branch (torch.no_grad → requires_grad=False)
+        # and the original branch (enable_grad → requires_grad=True from the ln_pre leaf).
+        # Only retain grad and record on the original branch pass.
+        if out.requires_grad:
+            out.retain_grad()
+            _act[0] = out
 
     h_pre    = vit.ln_pre.register_forward_hook(ln_pre_hook)
     h_target = target_block.register_forward_hook(target_hook)
