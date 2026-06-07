@@ -197,6 +197,44 @@ def compute_gradcam(model, img_tensor, block_idx: int = -8) -> np.ndarray | None
 
 # ── SAM-based semantic occlusion ─────────────────────────────────
 
+def _best_replacement_score(model, img_tensor, seg_np, n_steps=30, lr=0.05):
+    """
+    Find pixel values for the segment that minimise the fake score (maximise
+    the real label).  Uses Adam gradient descent on the segment pixels only,
+    with the rest of the image frozen.
+
+    Returns the minimised fake probability — i.e. the lowest fake score
+    achievable by replacing only this segment.
+
+    drop = baseline − best_replacement_score  answers the question:
+      "If the model could see the best possible pixels here, how much less
+       confident would it be that this image is fake?"
+    A large positive drop means THIS region is driving the fake detection.
+    A near-zero drop means the fake signal lives elsewhere.
+    """
+    seg_t  = torch.from_numpy(seg_np).to(img_tensor.device)          # [H, W] bool
+    mask4d = seg_t.float().unsqueeze(0).unsqueeze(0).expand_as(img_tensor)  # [1,3,H,W]
+    base   = img_tensor.detach()
+
+    # Learnable replacement initialised to 0 (= dataset mean in normalised space)
+    repl = torch.zeros_like(img_tensor, requires_grad=True)
+    opt  = torch.optim.Adam([repl], lr=lr)
+
+    for _ in range(n_steps):
+        opt.zero_grad()
+        composed = base * (1.0 - mask4d) + repl * mask4d
+        with torch.enable_grad():
+            fake_score = _forward_grad(model, composed).sigmoid()
+        fake_score.backward()
+        opt.step()
+        with torch.no_grad():
+            repl.clamp_(-3.0, 3.0)   # stay within plausible normalised range
+
+    with torch.no_grad():
+        composed = base * (1.0 - mask4d) + repl.detach() * mask4d
+        return model(composed).sigmoid().item()
+
+
 def compute_sam_occlusion(
     model,
     img_tensor,
@@ -209,21 +247,28 @@ def compute_sam_occlusion(
     guidance_raw=None,
     importance_percentile: int = 75,
     precision_thresh: float = 0.5,
+    optimal: bool = False,
+    optimal_steps: int = 30,
 ):
     """
     SAM semantic occlusion, optionally guided by a coarse grid-occlusion map.
 
-    For each SAM segment, replace its pixels with the dataset mean (0 in
-    normalised space) and record:
-      drop = baseline_score − occluded_score
-        > 0  →  region supports fake detection
-        < 0  →  region suppresses fake detection
+    For each SAM segment, measure its contribution to the fake decision:
 
-    If guidance_raw is provided (the [n_h, n_w] raw score array from
-    compute_occlusion), segments are filtered to those where at least
-    precision_thresh of their pixels fall inside the top-importance tiles.
-    This removes large unimportant regions (roof, seat, background) that
-    dominate raw-Δ ranking purely due to size.
+      optimal=False (default):
+        Replace segment with dataset mean (0) and record the score drop.
+        Fast, but weak baseline — the image still looks fake from everything else.
+
+      optimal=True:
+        Use gradient descent to find the pixel values for this segment that
+        BEST minimise the fake score (maximise real label).
+        drop = baseline − best_achievable_score
+        A large drop means this segment IS driving detection.
+        A near-zero drop means the fake signal lives elsewhere, regardless of
+        what you put here.  Much more informative for saturated-confidence images.
+
+    If guidance_raw is provided, segments are filtered to those where at least
+    precision_thresh of their pixels fall inside the top occlusion-importance tiles.
 
     Returns a [224,224] heatmap in [0,1] and saves a ranked segment figure.
     """
@@ -243,9 +288,9 @@ def compute_sam_occlusion(
         points_per_side=points_per_side,
         pred_iou_thresh=0.86,
         stability_score_thresh=0.92,
-        min_mask_region_area=100,
+        min_mask_region_area=500,   # filter out sub-object fragments
     )
-    img_np = np.array(img_pil)                    # [224, 224, 3] uint8
+    img_np = np.array(img_pil)
     masks  = mask_gen.generate(img_np)
     print(f"  SAM found {len(masks)} segments")
     if not masks:
@@ -256,33 +301,43 @@ def compute_sam_occlusion(
         patch_size = 224 // guidance_raw.shape[0]
         hot_up = np.repeat(np.repeat(guidance_raw, patch_size, axis=0),
                            patch_size, axis=1)[:224, :224]
-        threshold    = np.percentile(hot_up, importance_percentile)
-        hot_mask     = hot_up >= threshold                # [224, 224] bool
-        before       = len(masks)
+        threshold = np.percentile(hot_up, importance_percentile)
+        hot_mask  = hot_up >= threshold
+        before    = len(masks)
         masks = [
             m for m in masks
             if (m["segmentation"] & hot_mask).sum() / max(m["segmentation"].sum(), 1)
                >= precision_thresh
         ]
         print(f"  Guidance filter: {before} → {len(masks)} segments "
-              f"(≥{precision_thresh:.0%} of segment inside hot region)")
+              f"(≥{precision_thresh:.0%} inside hot region)")
         if not masks:
-            print("  All segments filtered out — skipping SAM occlusion")
+            print("  All segments filtered — skipping SAM occlusion")
             return None
 
-    # ── occlude each segment ──────────────────────────────────────
+    # ── score each segment ────────────────────────────────────────
     with torch.no_grad():
         baseline = model(img_tensor).sigmoid().item()
 
+    mode_str = f"optimal replacement ({optimal_steps} steps)" if optimal else "mean occlusion"
+    print(f"  Scoring {len(masks)} segments via {mode_str} …")
+
     drops = []
-    with torch.no_grad():
-        for m in masks:
-            seg    = m["segmentation"]               # [224, 224] bool numpy
-            masked = img_tensor.clone()
-            # Correct 4-D indexing: expand mask to [1, 3, 224, 224]
-            seg_t  = torch.from_numpy(seg).to(img_tensor.device)
-            masked[:, :, seg_t] = 0.0
-            drops.append(baseline - model(masked).sigmoid().item())
+    for i, m in enumerate(masks):
+        seg = m["segmentation"]
+        if optimal:
+            best_score = _best_replacement_score(
+                model, img_tensor, seg, n_steps=optimal_steps
+            )
+            drops.append(baseline - best_score)
+        else:
+            with torch.no_grad():
+                masked = img_tensor.clone()
+                seg_t  = torch.from_numpy(seg).to(img_tensor.device)
+                masked[:, :, seg_t] = 0.0
+                drops.append(baseline - model(masked).sigmoid().item())
+        if (i + 1) % 5 == 0:
+            print(f"    {i+1}/{len(masks)} …")
 
     # ── heatmap ───────────────────────────────────────────────────
     heatmap = np.zeros((224, 224), dtype=np.float32)
@@ -603,6 +658,11 @@ def main():
                         help="Occlusion percentile threshold for SAM guidance hot region")
     parser.add_argument("--sam_precision", type=float, default=0.5,
                         help="Min fraction of a SAM segment's pixels inside hot region to keep it")
+    parser.add_argument("--sam_optimal", action="store_true",
+                        help="Use optimal replacement (gradient descent) instead of mean occlusion. "
+                             "Much more informative for high-confidence images.")
+    parser.add_argument("--sam_optimal_steps", type=int, default=30,
+                        help="Gradient descent steps for optimal replacement")
     opt = parser.parse_args()
 
     methods = set(opt.method)
@@ -669,6 +729,8 @@ def main():
                 guidance_raw=guidance,
                 importance_percentile=opt.sam_importance_pct,
                 precision_thresh=opt.sam_precision,
+                optimal=opt.sam_optimal,
+                optimal_steps=opt.sam_optimal_steps,
             )
             label = "SAM Occlusion\n(guided)" if guided else "SAM Occlusion"
             results.append((label, h))
