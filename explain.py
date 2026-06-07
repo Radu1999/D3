@@ -25,7 +25,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
-from scipy.ndimage import gaussian_filter
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -177,70 +176,41 @@ def compute_gradcam(model, img_tensor) -> np.ndarray | None:
 
 # ── Occlusion ────────────────────────────────────────────────────
 
-def compute_occlusion(
-    model, img_tensor,
-    patch_size: int = 14,
-    stride: int | None = None,
-    batch_size: int = 32,
-    smooth_sigma: float = 1.5,
-):
+def compute_occlusion(model, img_tensor, patch_size: int = 14):
     """
-    Sliding-window occlusion: replace each (patch_size × patch_size) window with
-    the dataset mean (= 0 in normalised space) and accumulate the score drop at
-    pixel level.  Overlapping windows are averaged, giving a full-resolution map.
+    Replace each (patch_size × patch_size) tile with the dataset mean (= 0 in
+    normalised space) and record the change in fake score.
 
-    Improvements over the naive approach:
-      • stride < patch_size  — sub-patch resolution via overlapping windows
-      • batched inference     — all masks run in mini-batches for speed
-      • pixel-level accumulation — no upsampling artefacts
-      • Gaussian smoothing   — reduces grid-pattern noise before normalisation
+    scores[i,j] = baseline_score − occluded_score
+      > 0  →  occluding this patch lowered the fake score  →  region supports fake detection
+      < 0  →  occluding this patch raised the fake score   →  region suppresses fake detection
 
-    scores > 0  →  occluding this region lowered the fake score  →  supports fake
-    scores < 0  →  occluding this region raised the fake score   →  suppresses fake
-
-    Returns (heatmap [224,224] in [0,1], raw_pixel_scores [224,224]).
+    Returns (heatmap [224,224] in [0,1], raw_scores [n_h, n_w]).
+    Default patch_size=14 aligns with ViT-L/14's native patch grid.
     """
     H, W = 224, 224
-    if stride is None:
-        stride = patch_size // 2   # 2× resolution by default
+    n_h, n_w = H // patch_size, W // patch_size
 
     with torch.no_grad():
         baseline = model(img_tensor).sigmoid().item()
 
-    # Enumerate all sliding-window positions
-    positions = [
-        (r0, r0 + patch_size, c0, c0 + patch_size)
-        for r0 in range(0, H - patch_size + 1, stride)
-        for c0 in range(0, W - patch_size + 1, stride)
-    ]
+    # Dataset mean in normalised space = 0
+    occluder_val = 0.0
+    raw = np.zeros((n_h, n_w), dtype=np.float32)
 
-    scores = []
     with torch.no_grad():
-        for start in range(0, len(positions), batch_size):
-            batch_pos = positions[start: start + batch_size]
-            n = len(batch_pos)
-            batch = img_tensor.expand(n, -1, -1, -1).clone()
-            for k, (r0, r1, c0, c1) in enumerate(batch_pos):
-                batch[k, :, r0:r1, c0:c1] = 0.0   # occlude with dataset mean
-            s = model(batch).sigmoid().squeeze(-1).cpu().numpy()   # [n]
-            scores.extend((baseline - s).tolist())
+        for i in range(n_h):
+            for j in range(n_w):
+                masked = img_tensor.clone()
+                r0, r1 = i * patch_size, (i + 1) * patch_size
+                c0, c1 = j * patch_size, (j + 1) * patch_size
+                masked[:, :, r0:r1, c0:c1] = occluder_val
+                raw[i, j] = baseline - model(masked).sigmoid().item()
 
-    # Accumulate per-pixel score drops (overlapping windows → average)
-    pixel_scores = np.zeros((H, W), dtype=np.float32)
-    pixel_counts = np.zeros((H, W), dtype=np.float32)
-    for (r0, r1, c0, c1), sc in zip(positions, scores):
-        pixel_scores[r0:r1, c0:c1] += sc
-        pixel_counts[r0:r1, c0:c1] += 1.0
-    pixel_scores /= np.maximum(pixel_counts, 1.0)
-
-    # Gaussian smoothing to reduce grid-pattern noise
-    if smooth_sigma > 0:
-        pixel_scores = gaussian_filter(pixel_scores, sigma=smooth_sigma)
-
-    # Symmetric normalisation: 0-drop → 0.5 (neutral), pos → >0.5, neg → <0.5
-    abs_max = max(abs(pixel_scores.min()), abs(pixel_scores.max())) + 1e-8
-    heatmap = _normalise((pixel_scores + abs_max) / (2 * abs_max))
-    return heatmap, pixel_scores
+    # Shift so 0-drop maps to 0.5 (neutral grey), above = important, below = suppressive
+    abs_max = max(abs(raw.min()), abs(raw.max())) + 1e-8
+    heatmap = _upsample_map((raw + abs_max) / (2 * abs_max))
+    return heatmap, raw
 
 
 # ── Attention Rollout ────────────────────────────────────────────
@@ -422,12 +392,6 @@ def main():
                         help="Number of interpolation steps for IG")
     parser.add_argument("--occlusion_patch", type=int, default=14,
                         help="Occlusion tile size in pixels (14 = ViT patch grid)")
-    parser.add_argument("--occlusion_stride", type=int, default=None,
-                        help="Stride for sliding-window occlusion (default: patch//2)")
-    parser.add_argument("--occlusion_batch", type=int, default=32,
-                        help="Mini-batch size for occlusion forward passes")
-    parser.add_argument("--occlusion_sigma", type=float, default=1.5,
-                        help="Gaussian smoothing sigma applied to occlusion map (0 = off)")
     opt = parser.parse_args()
 
     methods = set(opt.method)
@@ -456,17 +420,10 @@ def main():
 
     if "occlusion" in methods:
         p = opt.occlusion_patch
-        s = opt.occlusion_stride or p // 2
-        n_windows = len(range(0, 224 - p + 1, s)) ** 2
-        print(f"Occlusion (patch={p}px, stride={s}px, {n_windows} windows, batch={opt.occlusion_batch}) …")
-        h, raw = compute_occlusion(
-            model, img_tensor,
-            patch_size=p,
-            stride=s,
-            batch_size=opt.occlusion_batch,
-            smooth_sigma=opt.occlusion_sigma,
-        )
-        results.append((f"Occlusion\n(patch={p}px, stride={s}px)", h))
+        print(f"Occlusion (patch={p}px, {224//p}×{224//p} grid) …")
+        h, raw = compute_occlusion(model, img_tensor, patch_size=p)
+        results.append((f"Occlusion\n(patch={p}px)", h))
+        # Optionally save raw score matrix alongside the image
         np.save(os.path.splitext(out_path)[0] + "_occlusion_raw.npy", raw)
 
     if "ig" in methods:
