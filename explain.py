@@ -195,6 +195,132 @@ def compute_gradcam(model, img_tensor, block_idx: int = -8) -> np.ndarray | None
         h_target.remove()
 
 
+# ── SAM-based semantic occlusion ─────────────────────────────────
+
+def compute_sam_occlusion(
+    model,
+    img_tensor,
+    img_pil,
+    sam_checkpoint: str,
+    sam_model_type: str = "vit_h",
+    points_per_side: int = 32,
+    top_k_vis: int = 10,
+    out_prefix: str = "",
+):
+    """
+    Semantic occlusion using Segment Anything Model (SAM).
+
+    Instead of occluding fixed 14×14 grid tiles, SAM first segments the image
+    into semantically meaningful regions.  Each region is then replaced with the
+    dataset mean (0 in normalised space) and the change in fake score is recorded.
+
+      drop[segment] = baseline_score − score_with_segment_occluded
+        > 0  →  this region supports the fake detection
+        < 0  →  this region suppresses the fake detection
+
+    Two outputs:
+      1. A continuous heatmap [224,224] where pixel value = accumulated score
+         drop of all segments that cover that pixel.  Used in the main figure.
+      2. A ranked segment figure (saved as <out_prefix>_sam_segments.png) showing
+         the top_k_vis most influential segments colour-coded by their drop.
+
+    Requires:
+      pip install segment-anything
+      # download a SAM checkpoint, e.g. vit_h from Meta's model zoo
+    """
+    try:
+        from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+    except ImportError:
+        print("SAM not installed — run: pip install segment-anything")
+        return None
+
+    print(f"  Loading SAM ({sam_model_type}) …")
+    sam = sam_model_registry[sam_model_type](checkpoint=sam_checkpoint)
+    sam.cuda().eval()
+
+    mask_gen = SamAutomaticMaskGenerator(
+        sam,
+        points_per_side=points_per_side,
+        pred_iou_thresh=0.86,
+        stability_score_thresh=0.92,
+        min_mask_region_area=100,   # drop tiny fragments
+    )
+
+    img_np = np.array(img_pil)   # [224, 224, 3]  uint8
+    masks  = mask_gen.generate(img_np)
+    print(f"  SAM found {len(masks)} segments")
+
+    if not masks:
+        return None
+
+    with torch.no_grad():
+        baseline = model(img_tensor).sigmoid().item()
+
+    # Score drop per segment
+    drops = []
+    with torch.no_grad():
+        for m in masks:
+            seg = m["segmentation"]          # [224, 224] bool
+            masked = img_tensor.clone()
+            masked[:, :, seg] = 0.0          # occlude with dataset mean
+            score = model(masked).sigmoid().item()
+            drops.append(baseline - score)
+
+    # ── continuous heatmap ────────────────────────────────────────
+    heatmap = np.zeros((224, 224), dtype=np.float32)
+    for m, d in zip(masks, drops):
+        heatmap[m["segmentation"]] += d
+
+    # Centre around 0, normalise to [0,1] using symmetric scale
+    abs_max = max(abs(heatmap.min()), abs(heatmap.max())) + 1e-8
+    heatmap_norm = (heatmap + abs_max) / (2 * abs_max)
+
+    # ── ranked segment figure ─────────────────────────────────────
+    if out_prefix:
+        _save_sam_segments(img_np, masks, drops, baseline, top_k_vis, out_prefix)
+
+    return heatmap_norm
+
+
+def _save_sam_segments(img_np, masks, drops, baseline, top_k, out_prefix):
+    """Save a figure showing the top_k segments ranked by |score drop|."""
+    ranked = sorted(zip(drops, masks), key=lambda x: abs(x[0]), reverse=True)
+    ranked = ranked[:top_k]
+
+    cols  = min(5, top_k)
+    rows  = (top_k + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows + 0.6))
+    axes = np.array(axes).reshape(-1)
+
+    cmap_pos = plt.get_cmap("Reds")
+    cmap_neg = plt.get_cmap("Blues")
+
+    for ax, (drop, m) in zip(axes, ranked):
+        seg   = m["segmentation"]
+        vis   = img_np.copy().astype(np.float32) / 255.0
+        # Dim non-segment pixels
+        vis[~seg] *= 0.25
+        # Tint segment by drop direction
+        color = cmap_pos(min(abs(drop) * 4, 1.0))[:3] if drop > 0 else cmap_neg(min(abs(drop) * 4, 1.0))[:3]
+        overlay = np.zeros_like(vis)
+        overlay[seg] = color
+        vis = np.clip(vis * 0.6 + overlay * 0.4, 0, 1)
+        ax.imshow(vis)
+        sign  = "▼ fake" if drop > 0 else "▲ fake"
+        ax.set_title(f"{sign}  Δ={drop:+.3f}\n(base {baseline:.3f})", fontsize=8)
+        ax.axis("off")
+
+    for ax in axes[len(ranked):]:
+        ax.axis("off")
+
+    plt.suptitle(f"Top-{top_k} SAM segments by |score drop|", fontsize=11)
+    plt.tight_layout()
+    seg_path = out_prefix + "_sam_segments.png"
+    plt.savefig(seg_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved segment ranking → {seg_path}")
+
+
 # ── Occlusion ────────────────────────────────────────────────────
 
 def compute_occlusion(model, img_tensor, patch_size: int = 14):
@@ -375,7 +501,7 @@ def save_visualization(img_pil, results, score, out_path):
     axes[0].axis("off")
 
     cmaps = {"GradCAM": "hot", "Occlusion": "RdBu_r", "Integrated Gradients": "hot",
-             "Attention Rollout": "hot"}
+             "Attention Rollout": "hot", "SAM Occlusion": "RdBu_r"}
     for ax, (title, heatmap) in zip(axes[1:], results):
         if heatmap is None:
             ax.text(0.5, 0.5, "failed", ha="center", va="center", fontsize=12)
@@ -404,7 +530,7 @@ def main():
     parser.add_argument("--image", required=True,
                         help="Path to a single image file")
     parser.add_argument("--method", nargs="+",
-                        choices=["gradcam", "occlusion", "ig", "attn", "all"],
+                        choices=["gradcam", "occlusion", "ig", "attn", "sam", "all"],
                         default=["all"],
                         help="Which methods to run")
     parser.add_argument("--output", default=None,
@@ -416,6 +542,13 @@ def main():
     parser.add_argument("--gradcam_layer", type=int, default=-8,
                         help="ViT block index for GradCAM (negative = from end; "
                              "default -8 = layer 16/24, good spatial selectivity)")
+    parser.add_argument("--sam_checkpoint", default=None,
+                        help="Path to SAM checkpoint (.pth). Required for --method sam")
+    parser.add_argument("--sam_model_type", default="vit_h",
+                        choices=["vit_h", "vit_l", "vit_b"],
+                        help="SAM model variant (vit_h is most accurate, vit_b fastest)")
+    parser.add_argument("--sam_top_k", type=int, default=10,
+                        help="Number of top segments to show in the segment ranking figure")
     opt = parser.parse_args()
 
     methods = set(opt.method)
@@ -462,6 +595,21 @@ def main():
         print("Attention Rollout …")
         h = compute_attention_rollout(model, img_tensor)
         results.append(("Attention Rollout\n(all ViT layers)", h))
+
+    if "sam" in methods:
+        if not opt.sam_checkpoint:
+            print("Skipping SAM occlusion — pass --sam_checkpoint <path>")
+        else:
+            print("SAM semantic occlusion …")
+            out_prefix = os.path.splitext(out_path)[0]
+            h = compute_sam_occlusion(
+                model, img_tensor, img_pil,
+                sam_checkpoint=opt.sam_checkpoint,
+                sam_model_type=opt.sam_model_type,
+                top_k_vis=opt.sam_top_k,
+                out_prefix=out_prefix,
+            )
+            results.append(("SAM Occlusion\n(semantic segments)", h))
 
     save_visualization(img_pil, results, score, out_path)
 
