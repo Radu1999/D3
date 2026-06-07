@@ -356,6 +356,132 @@ def _save_sam_segments(img_np, masks, drops, baseline, top_k, out_prefix):
     print(f"  Saved segment ranking → {seg_path}")
 
 
+# ── Occlusion-guided SAM occlusion ───────────────────────────────
+
+def compute_guided_sam_occlusion(
+    model,
+    img_tensor,
+    img_pil,
+    sam_checkpoint: str,
+    sam_model_type: str = "vit_h",
+    occlusion_patch: int = 14,
+    importance_percentile: int = 75,
+    overlap_thresh: float = 0.25,
+    points_per_side: int = 32,
+    top_k_vis: int = 10,
+    out_prefix: str = "",
+):
+    """
+    Two-stage coarse-to-fine occlusion:
+
+    Stage 1 — Grid occlusion (fast, coarse):
+      Occlude each (occlusion_patch × occlusion_patch) tile and record score drops.
+      Threshold at `importance_percentile` to build a binary "hot region" mask.
+
+    Stage 2 — SAM inside hot regions (precise, semantic):
+      Run SAM on the full image to get object-level segments.
+      Keep only segments where at least `overlap_thresh` fraction of their pixels
+      fall inside the hot region mask.  This discards background blobs like the
+      roof or seat that dominated raw-Δ ranking purely due to their size.
+
+    Stage 3 — Re-occlude filtered segments:
+      For each kept segment, replace its pixels with the dataset mean and record
+      the exact score drop.  Segments are ranked and visualised as before.
+
+    Returns the continuous heatmap [224,224] for the main figure, and saves a
+    separate ranked-segment figure at <out_prefix>_sam_guided_segments.png.
+    """
+    try:
+        from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+    except ImportError:
+        print("SAM not installed — run: pip install segment-anything")
+        return None
+
+    # ── Stage 1: coarse grid occlusion ───────────────────────────
+    print("  Stage 1: coarse grid occlusion …")
+    _, raw = compute_occlusion(model, img_tensor, patch_size=occlusion_patch)
+    # raw: [n_h, n_w]  score drops per tile
+
+    # Upsample to pixel level
+    raw_up = np.repeat(np.repeat(raw, occlusion_patch, axis=0), occlusion_patch, axis=1)
+    # Pad/crop to exactly 224×224 (in case 224 % patch_size != 0)
+    raw_up = raw_up[:224, :224]
+    pad_h  = max(0, 224 - raw_up.shape[0])
+    pad_w  = max(0, 224 - raw_up.shape[1])
+    if pad_h or pad_w:
+        raw_up = np.pad(raw_up, ((0, pad_h), (0, pad_w)), mode="edge")
+
+    threshold      = np.percentile(raw_up, importance_percentile)
+    important_mask = raw_up >= threshold   # [224, 224] bool
+
+    hot_frac = important_mask.mean()
+    print(f"  Hot region covers {hot_frac*100:.1f}% of pixels "
+          f"(threshold Δ ≥ {threshold:.4f})")
+
+    # ── Stage 2: SAM + filter by overlap ─────────────────────────
+    print(f"  Stage 2: SAM ({sam_model_type}) …")
+    sam = sam_model_registry[sam_model_type](checkpoint=sam_checkpoint)
+    sam.cuda().eval()
+
+    mask_gen = SamAutomaticMaskGenerator(
+        sam,
+        points_per_side=points_per_side,
+        pred_iou_thresh=0.86,
+        stability_score_thresh=0.92,
+        min_mask_region_area=100,
+    )
+    img_np = np.array(img_pil)
+    masks  = mask_gen.generate(img_np)
+    print(f"  SAM found {len(masks)} total segments")
+
+    filtered = [
+        m for m in masks
+        if (m["segmentation"] & important_mask).sum() / max(m["segmentation"].sum(), 1)
+           >= overlap_thresh
+    ]
+    print(f"  {len(filtered)} segments overlap hot region "
+          f"(overlap_thresh={overlap_thresh:.0%})")
+
+    if not filtered:
+        print("  No segments passed overlap filter — lowering threshold to 0.1")
+        filtered = [
+            m for m in masks
+            if (m["segmentation"] & important_mask).sum() / max(m["segmentation"].sum(), 1)
+               >= 0.1
+        ]
+
+    if not filtered:
+        return None
+
+    # ── Stage 3: re-occlude filtered segments ────────────────────
+    print(f"  Stage 3: re-occluding {len(filtered)} segments …")
+    with torch.no_grad():
+        baseline = model(img_tensor).sigmoid().item()
+
+    drops = []
+    with torch.no_grad():
+        for m in filtered:
+            seg    = m["segmentation"]
+            masked = img_tensor.clone()
+            masked[:, :, seg] = 0.0
+            drops.append(baseline - model(masked).sigmoid().item())
+
+    # ── heatmap ───────────────────────────────────────────────────
+    heatmap = np.zeros((224, 224), dtype=np.float32)
+    for m, d in zip(filtered, drops):
+        heatmap[m["segmentation"]] += d
+    abs_max      = max(abs(heatmap.min()), abs(heatmap.max())) + 1e-8
+    heatmap_norm = (heatmap + abs_max) / (2 * abs_max)
+
+    if out_prefix:
+        _save_sam_segments(
+            img_np, filtered, drops, baseline, top_k_vis,
+            out_prefix + "_guided",
+        )
+
+    return heatmap_norm
+
+
 # ── Occlusion ────────────────────────────────────────────────────
 
 def compute_occlusion(model, img_tensor, patch_size: int = 14):
@@ -536,7 +662,8 @@ def save_visualization(img_pil, results, score, out_path):
     axes[0].axis("off")
 
     cmaps = {"GradCAM": "hot", "Occlusion": "RdBu_r", "Integrated Gradients": "hot",
-             "Attention Rollout": "hot", "SAM Occlusion": "RdBu_r"}
+             "Attention Rollout": "hot", "SAM Occlusion": "RdBu_r",
+             "SAM Guided Occlusion": "RdBu_r"}
     for ax, (title, heatmap) in zip(axes[1:], results):
         if heatmap is None:
             ax.text(0.5, 0.5, "failed", ha="center", va="center", fontsize=12)
@@ -565,7 +692,7 @@ def main():
     parser.add_argument("--image", required=True,
                         help="Path to a single image file")
     parser.add_argument("--method", nargs="+",
-                        choices=["gradcam", "occlusion", "ig", "attn", "sam", "all"],
+                        choices=["gradcam", "occlusion", "ig", "attn", "sam", "sam_guided", "all"],
                         default=["all"],
                         help="Which methods to run")
     parser.add_argument("--output", default=None,
@@ -584,6 +711,10 @@ def main():
                         help="SAM model variant (vit_h is most accurate, vit_b fastest)")
     parser.add_argument("--sam_top_k", type=int, default=10,
                         help="Number of top segments to show in the segment ranking figure")
+    parser.add_argument("--sam_importance_pct", type=int, default=75,
+                        help="Percentile threshold for grid-occlusion hot region (sam_guided only)")
+    parser.add_argument("--sam_overlap", type=float, default=0.25,
+                        help="Min fraction of a SAM segment inside hot region to keep it (sam_guided only)")
     opt = parser.parse_args()
 
     methods = set(opt.method)
@@ -625,6 +756,24 @@ def main():
         print(f"Integrated Gradients (steps={opt.ig_steps}) …")
         h = compute_integrated_gradients(model, img_tensor, steps=opt.ig_steps)
         results.append((f"Integrated Gradients\n(steps={opt.ig_steps})", h))
+
+    if "sam_guided" in methods:
+        if not opt.sam_checkpoint:
+            print("Skipping SAM guided occlusion — pass --sam_checkpoint <path>")
+        else:
+            print("SAM guided occlusion (coarse→fine) …")
+            out_prefix = os.path.splitext(out_path)[0]
+            h = compute_guided_sam_occlusion(
+                model, img_tensor, img_pil,
+                sam_checkpoint=opt.sam_checkpoint,
+                sam_model_type=opt.sam_model_type,
+                occlusion_patch=opt.occlusion_patch,
+                importance_percentile=opt.sam_importance_pct,
+                overlap_thresh=opt.sam_overlap,
+                top_k_vis=opt.sam_top_k,
+                out_prefix=out_prefix,
+            )
+            results.append(("SAM Guided Occlusion\n(coarse→fine)", h))
 
     if "attn" in methods:
         print("Attention Rollout …")
