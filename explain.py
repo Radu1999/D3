@@ -213,6 +213,72 @@ def compute_occlusion(model, img_tensor, patch_size: int = 14):
     return heatmap, raw
 
 
+# ── Attention Rollout ────────────────────────────────────────────
+
+def compute_attention_rollout(model, img_tensor) -> np.ndarray | None:
+    """
+    Attention Rollout over CLIP ViT-L/14.  Hooks each block's forward to
+    extract Q,K projections and compute per-layer attention matrices, then
+    multiplies them with identity residuals to roll out CLS→patch importance.
+
+    Returns a [224,224] float32 heatmap in [0,1], or None on failure.
+    """
+    vit = model.model.visual
+    blocks = list(vit.transformer.resblocks.children())
+
+    stored = []   # one list per block, each holding a single [L,L] tensor
+
+    def make_hook(idx):
+        def hook(module, inp, out):
+            x = inp[0].detach().float()   # [L, 1, D]  (LND convention)
+            attn_mod = module.attn
+            L, B, D = x.shape
+            H = attn_mod.num_heads
+            head_dim = D // H
+
+            w = attn_mod.in_proj_weight.float()
+            b = attn_mod.in_proj_bias.float() if attn_mod.in_proj_bias is not None else None
+            xf = x.reshape(L * B, D)
+            qkv = xf @ w.T
+            if b is not None:
+                qkv = qkv + b
+            q, k, _ = qkv.chunk(3, dim=-1)
+            q = q.reshape(L, B, H, head_dim).permute(1, 2, 0, 3)
+            k = k.reshape(L, B, H, head_dim).permute(1, 2, 0, 3)
+            A = (q @ k.transpose(-2, -1) * (head_dim ** -0.5)).softmax(dim=-1)
+            stored[idx] = A.mean(dim=1)[0].cpu()   # [L, L]
+        return hook
+
+    stored = [None] * len(blocks)
+    handles = [blk.register_forward_hook(make_hook(i)) for i, blk in enumerate(blocks)]
+
+    try:
+        with torch.no_grad():
+            model(img_tensor)
+    finally:
+        for h in handles:
+            h.remove()
+
+    if any(s is None for s in stored):
+        print("Attention rollout: some layers did not fire.")
+        return None
+
+    # Rollout: R = (A_L + I)/2 @ … @ (A_1 + I)/2
+    # Adding identity models the residual connection; /2 re-normalises rows.
+    L = stored[0].shape[0]
+    rollout = torch.eye(L)
+    for A in stored:
+        A_res = (A + torch.eye(L)) / 2.0
+        # re-normalise rows so they sum to 1
+        A_res = A_res / A_res.sum(dim=-1, keepdim=True)
+        rollout = A_res @ rollout
+
+    # CLS token row: how much each token flows into CLS
+    cls_row = rollout[0, 1:]   # [256] — drop CLS→CLS entry
+    heatmap = _normalise(cls_row.reshape(GRID, GRID).numpy())
+    return _upsample_map(heatmap)
+
+
 # ── Integrated Gradients ─────────────────────────────────────────
 
 def compute_integrated_gradients(
@@ -254,8 +320,9 @@ def compute_integrated_gradients(
     avg_grads = torch.stack(grads).mean(dim=0)   # [1, 3, 224, 224]
     ig = (delta.cpu() * avg_grads)               # element-wise product
 
-    # Sum over colour channels → spatial importance map
-    heatmap = _normalise(ig.squeeze(0).sum(dim=0).numpy())
+    # Sum absolute attributions over colour channels → spatial importance map
+    # Using abs() prevents positive/negative channel contributions from cancelling
+    heatmap = _normalise(ig.squeeze(0).abs().sum(dim=0).numpy())
     return heatmap
 
 
@@ -286,7 +353,8 @@ def save_visualization(img_pil, results, score, out_path):
                       fontsize=10, color=color, fontweight="bold")
     axes[0].axis("off")
 
-    cmaps = {"GradCAM": "hot", "Occlusion": "RdBu_r", "Integrated Gradients": "hot"}
+    cmaps = {"GradCAM": "hot", "Occlusion": "RdBu_r", "Integrated Gradients": "hot",
+             "Attention Rollout": "hot"}
     for ax, (title, heatmap) in zip(axes[1:], results):
         if heatmap is None:
             ax.text(0.5, 0.5, "failed", ha="center", va="center", fontsize=12)
@@ -315,7 +383,7 @@ def main():
     parser.add_argument("--image", required=True,
                         help="Path to a single image file")
     parser.add_argument("--method", nargs="+",
-                        choices=["gradcam", "occlusion", "ig", "all"],
+                        choices=["gradcam", "occlusion", "ig", "attn", "all"],
                         default=["all"],
                         help="Which methods to run")
     parser.add_argument("--output", default=None,
@@ -328,7 +396,7 @@ def main():
 
     methods = set(opt.method)
     if "all" in methods:
-        methods = {"gradcam", "occlusion", "ig"}
+        methods = {"gradcam", "occlusion", "ig", "attn"}
 
     out_path = opt.output or (os.path.splitext(opt.image)[0] + "_explain.png")
 
@@ -362,6 +430,11 @@ def main():
         print(f"Integrated Gradients (steps={opt.ig_steps}) …")
         h = compute_integrated_gradients(model, img_tensor, steps=opt.ig_steps)
         results.append((f"Integrated Gradients\n(steps={opt.ig_steps})", h))
+
+    if "attn" in methods:
+        print("Attention Rollout …")
+        h = compute_attention_rollout(model, img_tensor)
+        results.append(("Attention Rollout\n(all ViT layers)", h))
 
     save_visualization(img_pil, results, score, out_path)
 
