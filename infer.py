@@ -355,6 +355,8 @@ def main():
                         help="K-means clustering on pre-fc embeddings to find optimal threshold")
     parser.add_argument("--cluster_pca", type=int, default=50,
                         help="PCA components before KMeans (default: 50)")
+    parser.add_argument("--subset", type=int, default=0,
+                        help="Randomly sample N images before inference (0 = use all)")
     parser.add_argument("--cluster_output", default="cluster_analysis.png",
                         help="Path for the cluster analysis plot (requires --cluster)")
     opt = parser.parse_args()
@@ -379,6 +381,15 @@ def main():
     if not paths:
         print(f"No images found in {opt.image_dir}")
         return
+
+    if opt.subset and opt.subset < len(paths):
+        rng = np.random.default_rng(418)
+        idx = rng.choice(len(paths), size=opt.subset, replace=False)
+        idx.sort()
+        paths = [paths[i] for i in idx]
+        labels = [labels[i] for i in idx] if labels is not None else None
+        print(f"Subset: using {opt.subset} randomly sampled images.")
+
     print(f"Found {len(paths)} images. Running inference...")
 
     results, valid_labels, embeddings = run_inference(
