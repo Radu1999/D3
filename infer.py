@@ -22,6 +22,7 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 from sklearn.metrics import (
     f1_score, accuracy_score, roc_auc_score,
     precision_score, recall_score, classification_report,
@@ -166,6 +167,33 @@ def print_eval_metrics(results, labels, threshold):
     print(classification_report(y_true, y_pred, target_names=["real", "fake"]))
 
 
+def plot_score_distribution(results, threshold, labels=None, output_path="score_distribution.png"):
+    scores = np.array([r[1] for r in results])
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    if labels is not None:
+        y_true = np.array(labels)
+        real_scores = scores[y_true == 0]
+        fake_scores = scores[y_true == 1]
+        bins = np.linspace(0, 1, 51)
+        ax.hist(real_scores, bins=bins, alpha=0.65, color="#4C8EDA", label=f"Real  (n={len(real_scores)})")
+        ax.hist(fake_scores, bins=bins, alpha=0.65, color="#E05C5C", label=f"Fake  (n={len(fake_scores)})")
+    else:
+        bins = np.linspace(0, 1, 51)
+        ax.hist(scores, bins=bins, color="#7B68EE", alpha=0.8, label=f"All images  (n={len(scores)})")
+
+    ax.axvline(threshold, color="black", linestyle="--", linewidth=1.5, label=f"Threshold = {threshold}")
+    ax.set_xlabel("Score  (0 = real, 1 = fake)", fontsize=12)
+    ax.set_ylabel("Count", fontsize=12)
+    ax.set_title("D³ Score Distribution", fontsize=14)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"  Score distribution saved to {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="D³ inference / eval")
     parser.add_argument("--checkpoint", required=True, help="Path to .pth checkpoint")
@@ -188,6 +216,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker processes for parallel image loading")
+    parser.add_argument("--plot", action="store_true",
+                        help="Save a score-distribution histogram to --plot_output")
+    parser.add_argument("--plot_output", default="score_distribution.png",
+                        help="Path for the score distribution plot (requires --plot)")
     opt = parser.parse_args()
 
     transform = transforms.Compose([
@@ -236,6 +268,14 @@ def main():
 
     scores = np.array([r[1] for r in results])
     n_fake = sum(1 for r in results if r[2] == "fake")
+
+    if opt.plot:
+        plot_score_distribution(
+            results, opt.threshold,
+            labels=valid_labels if opt.eval else None,
+            output_path=opt.plot_output,
+        )
+
     print(f"\nDone. Results saved to {opt.output} and {opt.output_json}")
     print(f"  Total: {len(results)}  |  Fake: {n_fake}  |  Real: {len(results) - n_fake}")
     print(f"  Score mean: {scores.mean():.3f}  |  std: {scores.std():.3f}")
