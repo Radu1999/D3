@@ -27,6 +27,8 @@ from sklearn.metrics import (
     f1_score, accuracy_score, roc_auc_score,
     precision_score, recall_score, classification_report,
 )
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from torch.utils.data import Dataset, DataLoader
 from models.clip_models import CLIPModelShuffleAttentionPenultimateLayer
 from models import get_model
@@ -113,13 +115,27 @@ class ImageDataset(Dataset):
         return img, label, path
 
 
-def run_inference(model, paths, batch_size, threshold, transform, labels=None, num_workers=4):
-    """Run inference using a DataLoader for parallel image loading."""
+def run_inference(model, paths, batch_size, threshold, transform,
+                  labels=None, num_workers=4, collect_embeddings=False):
+    """Run inference using a DataLoader for parallel image loading.
+
+    When collect_embeddings=True and the model has an attention_head, a forward
+    hook captures the pre-fc embedding (input to attention_head.fc) for every
+    sample.  This adds no extra GPU passes.
+    """
     dataset = ImageDataset(paths, labels, transform)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
     )
+
+    emb_batches = []
+    hook_handle = None
+    if collect_embeddings and hasattr(model, "attention_head"):
+        def _capture_pre_fc(module, inp, out):
+            # inp[0]: (B, input_dim * n_tokens) — the flattened vector before fc
+            emb_batches.append(inp[0].detach().cpu().float().numpy())
+        hook_handle = model.attention_head.fc.register_forward_hook(_capture_pre_fc)
 
     results = []
     valid_labels = [] if labels is not None else None
@@ -135,7 +151,12 @@ def run_inference(model, paths, batch_size, threshold, transform, labels=None, n
                 results.append((path, float(score), "fake" if score > threshold else "real"))
                 if valid_labels is not None:
                     valid_labels.append(lbl)
-    return results, valid_labels
+
+    if hook_handle is not None:
+        hook_handle.remove()
+
+    embeddings = np.concatenate(emb_batches, axis=0) if emb_batches else None
+    return results, valid_labels, embeddings
 
 
 def print_eval_metrics(results, labels, threshold):
@@ -165,6 +186,116 @@ def print_eval_metrics(results, labels, threshold):
     print(f"  ROC-AUC:   {roc_auc:.4f}")
     print(f"{'='*50}")
     print(classification_report(y_true, y_pred, target_names=["real", "fake"]))
+
+
+def cluster_threshold_analysis(embeddings, scores, n_pca=50, random_state=418):
+    """K-means (k=2) on pre-fc embeddings → optimal threshold via Youden's J.
+
+    Returns
+    -------
+    optimal_threshold : float
+        Score cutpoint that maximises Youden's J against cluster pseudo-labels.
+    cluster_labels : np.ndarray  shape (N,)
+        Per-sample cluster assignment, aligned so 1 = higher-score cluster (fake).
+    pca_2d : np.ndarray  shape (N, 2)
+        First two PCA components for scatter plotting.
+    youden_curve : (thresholds, j_scores)
+        Full sweep so callers can plot it.
+    """
+    n_samples, n_features = embeddings.shape
+    n_components = min(n_pca, n_samples, n_features)
+    print(f"\n[Cluster] PCA {n_features}→{n_components} dims on {n_samples} samples...")
+    pca_full = PCA(n_components=n_components, random_state=random_state)
+    emb_pca = pca_full.fit_transform(embeddings)
+    var_explained = pca_full.explained_variance_ratio_.sum()
+    print(f"[Cluster] Variance explained by {n_components} PCs: {var_explained*100:.1f}%")
+
+    pca_2d_obj = PCA(n_components=2, random_state=random_state)
+    pca_2d = pca_2d_obj.fit_transform(embeddings)
+
+    print("[Cluster] Running KMeans (k=2)...")
+    km = KMeans(n_clusters=2, n_init=20, random_state=random_state)
+    raw_labels = km.fit_predict(emb_pca)
+
+    # Align: cluster with higher mean score → label 1 (fake)
+    mean0 = scores[raw_labels == 0].mean()
+    mean1 = scores[raw_labels == 1].mean()
+    cluster_labels = raw_labels if mean1 >= mean0 else 1 - raw_labels
+
+    # Sweep thresholds, maximise Youden's J = sensitivity + specificity − 1
+    thresholds = np.linspace(0.01, 0.99, 990)
+    j_scores = np.array([
+        recall_score(cluster_labels, (scores > t).astype(int), zero_division=0)
+        + recall_score(1 - cluster_labels, (scores <= t).astype(int), zero_division=0)
+        - 1
+        for t in thresholds
+    ])
+    best_idx = int(np.argmax(j_scores))
+    optimal_threshold = float(thresholds[best_idx])
+
+    n_fake_cluster = int(cluster_labels.sum())
+    n_real_cluster = len(cluster_labels) - n_fake_cluster
+    print(f"[Cluster] Cluster sizes — real: {n_real_cluster}, fake: {n_fake_cluster}")
+    print(f"[Cluster] Optimal threshold (max Youden's J={j_scores[best_idx]:.4f}): {optimal_threshold:.4f}")
+
+    return optimal_threshold, cluster_labels, pca_2d, (thresholds, j_scores)
+
+
+def plot_cluster_analysis(results, scores, cluster_labels, pca_2d,
+                          threshold, optimal_threshold, youden_curve,
+                          labels=None, output_path="cluster_analysis.png"):
+    """Three-panel figure: PCA scatter | score distributions | Youden's J curve."""
+    thresholds, j_scores = youden_curve
+    y_true = np.array(labels) if labels is not None else None
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # --- Panel 1: 2D PCA scatter coloured by cluster ---
+    ax = axes[0]
+    colors = np.where(cluster_labels == 1, "#E05C5C", "#4C8EDA")
+    ax.scatter(pca_2d[:, 0], pca_2d[:, 1], c=colors, s=8, alpha=0.5, linewidths=0)
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(color="#4C8EDA", label="Cluster: real"),
+                        Patch(color="#E05C5C", label="Cluster: fake")], fontsize=9)
+    ax.set_title("Pre-fc Embeddings (PCA 2D)", fontsize=12)
+    ax.set_xlabel("PC 1")
+    ax.set_ylabel("PC 2")
+
+    # --- Panel 2: score histograms with both thresholds ---
+    ax = axes[1]
+    bins = np.linspace(0, 1, 51)
+    if y_true is not None:
+        ax.hist(scores[y_true == 0], bins=bins, alpha=0.55, color="#4C8EDA", label="Real (GT)")
+        ax.hist(scores[y_true == 1], bins=bins, alpha=0.55, color="#E05C5C", label="Fake (GT)")
+    else:
+        real_mask = cluster_labels == 0
+        ax.hist(scores[real_mask],  bins=bins, alpha=0.55, color="#4C8EDA", label="Cluster: real")
+        ax.hist(scores[~real_mask], bins=bins, alpha=0.55, color="#E05C5C", label="Cluster: fake")
+    ax.axvline(threshold, color="black",  linestyle="--", linewidth=1.5,
+               label=f"Current threshold = {threshold}")
+    ax.axvline(optimal_threshold, color="#FF8C00", linestyle="-", linewidth=2,
+               label=f"Cluster-optimal = {optimal_threshold:.4f}")
+    ax.set_xlabel("Score  (0 = real, 1 = fake)", fontsize=11)
+    ax.set_ylabel("Count", fontsize=11)
+    ax.set_title("Score Distribution", fontsize=12)
+    ax.legend(fontsize=9)
+
+    # --- Panel 3: Youden's J vs threshold ---
+    ax = axes[2]
+    ax.plot(thresholds, j_scores, color="#7B68EE", linewidth=1.5)
+    ax.axvline(optimal_threshold, color="#FF8C00", linestyle="-", linewidth=2,
+               label=f"Optimal = {optimal_threshold:.4f}  (J={j_scores.max():.4f})")
+    ax.axvline(threshold, color="black", linestyle="--", linewidth=1.5,
+               label=f"Current = {threshold}")
+    ax.set_xlabel("Threshold", fontsize=11)
+    ax.set_ylabel("Youden's J", fontsize=11)
+    ax.set_title("Threshold Sweep (Youden's J)", fontsize=12)
+    ax.legend(fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"  Cluster analysis plot saved to {output_path}")
 
 
 def plot_score_distribution(results, threshold, labels=None, output_path="score_distribution.png"):
@@ -213,13 +344,19 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Decision threshold: score > threshold => fake")
     parser.add_argument("--output_json", default="predictions.json", help="Output JSON path")
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--num_workers", type=int, default=4,
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--num_workers", type=int, default=8,
                         help="DataLoader worker processes for parallel image loading")
     parser.add_argument("--plot", action="store_true",
                         help="Save a score-distribution histogram to --plot_output")
     parser.add_argument("--plot_output", default="score_distribution.png",
                         help="Path for the score distribution plot (requires --plot)")
+    parser.add_argument("--cluster", action="store_true",
+                        help="K-means clustering on pre-fc embeddings to find optimal threshold")
+    parser.add_argument("--cluster_pca", type=int, default=50,
+                        help="PCA components before KMeans (default: 50)")
+    parser.add_argument("--cluster_output", default="cluster_analysis.png",
+                        help="Path for the cluster analysis plot (requires --cluster)")
     opt = parser.parse_args()
 
     transform = transforms.Compose([
@@ -244,9 +381,10 @@ def main():
         return
     print(f"Found {len(paths)} images. Running inference...")
 
-    results, valid_labels = run_inference(
+    results, valid_labels, embeddings = run_inference(
         model, paths, opt.batch_size, opt.threshold, transform,
         labels=labels, num_workers=opt.num_workers,
+        collect_embeddings=opt.cluster,
     )
 
     with open(opt.output, "w", newline="") as f:
@@ -268,6 +406,21 @@ def main():
 
     scores = np.array([r[1] for r in results])
     n_fake = sum(1 for r in results if r[2] == "fake")
+
+    if opt.cluster and embeddings is not None:
+        optimal_threshold, cluster_labels, pca_2d, youden_curve = cluster_threshold_analysis(
+            embeddings, scores, n_pca=opt.cluster_pca,
+        )
+        plot_cluster_analysis(
+            results, scores, cluster_labels, pca_2d,
+            threshold=opt.threshold,
+            optimal_threshold=optimal_threshold,
+            youden_curve=youden_curve,
+            labels=valid_labels if opt.eval else None,
+            output_path=opt.cluster_output,
+        )
+    elif opt.cluster:
+        print("[Cluster] Skipped: model has no attention_head (unsupported arch).")
 
     if opt.plot:
         plot_score_distribution(
